@@ -11,12 +11,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md LICENSE ./
+# Copy only files that exist
+COPY pyproject.toml ./
 COPY src/ ./src/
 
-# Create config directory and copy if exists
+# Copy README and LICENSE if they exist, otherwise skip
+COPY README.md ./ 2>/dev/null || echo "No README.md"
+COPY LICENSE ./ 2>/dev/null || echo "No LICENSE"
+
+# Create and copy config directory
 RUN mkdir -p ./config
-COPY config/ ./config/ 2>/dev/null || true
+COPY config/*.yaml ./config/ 2>/dev/null || echo "No config files"
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -e .
@@ -28,5 +33,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Render provides PORT env var
 CMD servicenow-mcp-sse --host=0.0.0.0 --port=${PORT:-8080}
