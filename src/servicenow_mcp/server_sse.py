@@ -1,5 +1,5 @@
 """
-ServiceNow MCP SSE Server Implementation
+ServiceNow MCP SSE Server Implementation with API Key Authentication
 """
 
 import argparse
@@ -11,8 +11,10 @@ from dotenv import load_dotenv
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from servicenow_mcp.server import ServiceNowMCP
 from servicenow_mcp.utils.config import AuthConfig, AuthType, BasicAuthConfig, ServerConfig
@@ -23,6 +25,35 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Middleware to validate API key for protected endpoints."""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth for health check
+        if request.url.path == "/health" or request.url.path == "/":
+            return await call_next(request)
+        
+        # Get API key from environment
+        expected_api_key = os.getenv("MCP_API_KEY")
+        
+        # If no API key is configured, allow all requests (backward compatible)
+        if not expected_api_key:
+            logger.warning("MCP_API_KEY not set - running without authentication!")
+            return await call_next(request)
+        
+        # Check API key in header
+        provided_api_key = request.headers.get("X-API-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
+        
+        if provided_api_key != expected_api_key:
+            logger.warning(f"Invalid API key attempt from {request.client}")
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Unauthorized", "message": "Invalid or missing API key"}
+            )
+        
+        return await call_next(request)
 
 
 def create_sse_server_app(mcp_server) -> Starlette:
@@ -76,7 +107,8 @@ def create_sse_server_app(mcp_server) -> Starlette:
         return JSONResponse({
             "status": "healthy",
             "service": "servicenow-mcp-sse",
-            "version": "0.1.0"
+            "version": "0.1.0",
+            "authentication": "enabled" if os.getenv("MCP_API_KEY") else "disabled"
         })
     
     async def root_handler(request: Request):
@@ -89,10 +121,11 @@ def create_sse_server_app(mcp_server) -> Starlette:
                 "sse": "/sse",
                 "messages": "/messages",
                 "health": "/health"
-            }
+            },
+            "authentication": "API Key required" if os.getenv("MCP_API_KEY") else "None"
         })
     
-    # Create Starlette app with routes
+    # Create Starlette app with routes and middleware
     app = Starlette(
         debug=True,
         routes=[
@@ -101,6 +134,9 @@ def create_sse_server_app(mcp_server) -> Starlette:
             Route("/sse", endpoint=sse_handler, methods=["GET"]),
             Route("/messages", endpoint=messages_handler, methods=["POST"]),
         ],
+        middleware=[
+            Middleware(APIKeyMiddleware)
+        ]
     )
     
     return app
@@ -169,6 +205,7 @@ def main():
     instance_url = os.getenv("SERVICENOW_INSTANCE_URL")
     username = os.getenv("SERVICENOW_USERNAME")
     password = os.getenv("SERVICENOW_PASSWORD")
+    api_key = os.getenv("MCP_API_KEY")
     
     # Validate required environment variables
     missing_vars = []
@@ -183,6 +220,16 @@ def main():
         logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
         logger.error("Please set these in your .env file or environment")
         raise ValueError(f"Missing environment variables: {missing_vars}")
+    
+    # Warn if API key is not set
+    if not api_key:
+        logger.warning("="*70)
+        logger.warning("MCP_API_KEY is not set!")
+        logger.warning("Server is running WITHOUT authentication")
+        logger.warning("Set MCP_API_KEY environment variable for production")
+        logger.warning("="*70)
+    else:
+        logger.info("API Key authentication enabled")
     
     logger.info("Environment variables loaded successfully")
     
