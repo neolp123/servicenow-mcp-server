@@ -187,11 +187,14 @@ def create_sse_server_app(mcp_server, servicenow_mcp_instance) -> Starlette:
                 session["initialized"] = True
                 session["capabilities"] = params.get("capabilities", {})
                 
+                # Use the client's requested protocol version for compatibility
+                client_version = params.get("protocolVersion", "2024-11-05")
+                
                 response = {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
-                        "protocolVersion": "2024-11-05",
+                        "protocolVersion": client_version,  # Echo back client's version
                         "capabilities": {
                             "tools": {}  # Server supports tools
                         },
