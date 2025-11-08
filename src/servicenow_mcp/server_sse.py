@@ -1,141 +1,221 @@
 """
-ServiceNow MCP Server
-
-This module provides the main implementation of the ServiceNow MCP server.
+ServiceNow MCP SSE Server Implementation
 """
 
 import argparse
+import logging
 import os
-from typing import Dict, Union
 
 import uvicorn
 from dotenv import load_dotenv
-from mcp.server import Server
-from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.routing import Mount, Route
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from servicenow_mcp.server import ServiceNowMCP
 from servicenow_mcp.utils.config import AuthConfig, AuthType, BasicAuthConfig, ServerConfig
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:
-    """Create a Starlette application that can serve the provided mcp server with SSE."""
-    sse = SseServerTransport("/messages/")
 
-    async def handle_sse(request: Request) -> None:
-        async with sse.connect_sse(
+def create_sse_server_app(mcp_server) -> Starlette:
+    """
+    Create Starlette app with SSE transport for MCP server.
+    
+    Args:
+        mcp_server: The low-level MCP Server instance
+        
+    Returns:
+        Configured Starlette application
+    """
+    # Create SSE transport with /messages path
+    sse_transport = SseServerTransport("/messages")
+    
+    async def sse_handler(request: Request):
+        """Handle SSE connection endpoint."""
+        logger.info(f"SSE connection request from {request.client}")
+        
+        try:
+            # Connect SSE and get streams
+            async with sse_transport.connect_sse(
+                request.scope,
+                request.receive,
+                request._send,
+            ) as streams:
+                logger.info("SSE streams established, running MCP server")
+                
+                # Run MCP server with the streams
+                await mcp_server.run(
+                    streams[0],  # read_stream
+                    streams[1],  # write_stream
+                    mcp_server.create_initialization_options(),
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in SSE handler: {e}", exc_info=True)
+            raise
+    
+    async def messages_handler(request: Request):
+        """Handle POST requests to /messages endpoint."""
+        logger.info(f"POST message from {request.client}")
+        return await sse_transport.handle_post_message(
             request.scope,
             request.receive,
-            request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            await mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp_server.create_initialization_options(),
-            )
-
-    return Starlette(
-        debug=debug,
+            request._send
+        )
+    
+    async def health_handler(request: Request):
+        """Health check endpoint."""
+        return JSONResponse({
+            "status": "healthy",
+            "service": "servicenow-mcp-sse",
+            "version": "0.1.0"
+        })
+    
+    async def root_handler(request: Request):
+        """Root endpoint with service information."""
+        return JSONResponse({
+            "service": "ServiceNow MCP Server",
+            "transport": "SSE",
+            "version": "0.1.0",
+            "endpoints": {
+                "sse": "/sse",
+                "messages": "/messages",
+                "health": "/health"
+            }
+        })
+    
+    # Create Starlette app with routes
+    app = Starlette(
+        debug=True,
         routes=[
-            Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
+            Route("/", endpoint=root_handler, methods=["GET"]),
+            Route("/health", endpoint=health_handler, methods=["GET"]),
+            Route("/sse", endpoint=sse_handler, methods=["GET"]),
+            Route("/messages", endpoint=messages_handler, methods=["POST"]),
         ],
     )
+    
+    return app
 
 
-class ServiceNowSSEMCP(ServiceNowMCP):
+def create_servicenow_sse_server(instance_url: str, username: str, password: str):
     """
-    ServiceNow MCP Server implementation.
-
-    This class provides a Model Context Protocol (MCP) server for ServiceNow,
-    allowing LLMs to interact with ServiceNow data and functionality.
-    """
-
-    def __init__(self, config: Union[Dict, ServerConfig]):
-        """
-        Initialize the ServiceNow MCP server.
-
-        Args:
-            config: Server configuration, either as a dictionary or ServerConfig object.
-        """
-        super().__init__(config)
-
-    def start(self, host: str = "0.0.0.0", port: int = 8080):
-        """
-        Start the MCP server with SSE transport using Starlette and Uvicorn.
-
-        Args:
-            host: Host address to bind to
-            port: Port to listen on
-        """
-        # Create Starlette app with SSE transport
-        starlette_app = create_starlette_app(self.mcp_server, debug=True)
-
-        # Run using uvicorn
-        uvicorn.run(starlette_app, host=host, port=port)
-
-
-def create_servicenow_mcp(instance_url: str, username: str, password: str):
-    """
-    Create a ServiceNow MCP server with minimal configuration.
-
-    This is a simplified factory function that creates a pre-configured
-    ServiceNow MCP server with basic authentication.
-
+    Factory function to create ServiceNow MCP server with SSE transport.
+    
     Args:
         instance_url: ServiceNow instance URL
         username: ServiceNow username
         password: ServiceNow password
-
+        
     Returns:
-        A configured ServiceNowMCP instance ready to use
-
-    Example:
-        ```python
-        from servicenow_mcp.server import create_servicenow_mcp
-
-        # Create an MCP server for ServiceNow
-        mcp = create_servicenow_mcp(
-            instance_url="https://instance.service-now.com",
-            username="admin",
-            password="password"
-        )
-
-        # Start the server
-        mcp.start()
-        ```
+        Tuple of (mcp_server, starlette_app)
     """
-
-    # Create basic auth config
+    logger.info(f"Creating ServiceNow MCP server for: {instance_url}")
+    
+    # Create auth configuration
     auth_config = AuthConfig(
-        type=AuthType.BASIC, basic=BasicAuthConfig(username=username, password=password)
+        type=AuthType.BASIC,
+        basic=BasicAuthConfig(username=username, password=password)
     )
-
-    # Create server config
-    config = ServerConfig(instance_url=instance_url, auth=auth_config)
-
-    # Create and return server
-    return ServiceNowSSEMCP(config)
+    
+    # Create server configuration
+    server_config = ServerConfig(
+        instance_url=instance_url,
+        auth=auth_config
+    )
+    
+    # Create MCP server instance
+    servicenow_mcp = ServiceNowMCP(server_config)
+    mcp_server = servicenow_mcp.start()
+    
+    # Create Starlette app with SSE transport
+    starlette_app = create_sse_server_app(mcp_server)
+    
+    logger.info("ServiceNow MCP SSE server created successfully")
+    
+    return mcp_server, starlette_app
 
 
 def main():
+    """Main entry point for SSE server."""
     load_dotenv()
-
+    
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Run ServiceNow MCP SSE-based server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
-    args = parser.parse_args()
-
-    server = create_servicenow_mcp(
-        instance_url=os.getenv("SERVICENOW_INSTANCE_URL"),
-        username=os.getenv("SERVICENOW_USERNAME"),
-        password=os.getenv("SERVICENOW_PASSWORD"),
+    parser = argparse.ArgumentParser(
+        description="ServiceNow MCP Server with SSE Transport"
     )
-    server.start(host=args.host, port=args.port)
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port to listen on (default: 8080)"
+    )
+    args = parser.parse_args()
+    
+    # Get environment variables
+    instance_url = os.getenv("SERVICENOW_INSTANCE_URL")
+    username = os.getenv("SERVICENOW_USERNAME")
+    password = os.getenv("SERVICENOW_PASSWORD")
+    
+    # Validate required environment variables
+    missing_vars = []
+    if not instance_url:
+        missing_vars.append("SERVICENOW_INSTANCE_URL")
+    if not username:
+        missing_vars.append("SERVICENOW_USERNAME")
+    if not password:
+        missing_vars.append("SERVICENOW_PASSWORD")
+    
+    if missing_vars:
+        logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        logger.error("Please set these in your .env file or environment")
+        raise ValueError(f"Missing environment variables: {missing_vars}")
+    
+    logger.info("Environment variables loaded successfully")
+    
+    # Create server and app
+    try:
+        mcp_server, starlette_app = create_servicenow_sse_server(
+            instance_url=instance_url,
+            username=username,
+            password=password
+        )
+        
+        logger.info(f"Starting server on {args.host}:{args.port}")
+        
+        # Configure uvicorn with SSE-friendly settings
+        config = uvicorn.Config(
+            starlette_app,
+            host=args.host,
+            port=args.port,
+            log_level="info",
+            access_log=True,
+            timeout_keep_alive=0,  # Disable timeout for SSE
+        )
+        
+        server = uvicorn.Server(config)
+        
+        logger.info(f"SSE endpoint available at: http://{args.host}:{args.port}/sse")
+        logger.info(f"Health check available at: http://{args.host}:{args.port}/health")
+        
+        server.run()
+        
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

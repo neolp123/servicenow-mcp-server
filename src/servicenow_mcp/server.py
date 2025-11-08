@@ -317,3 +317,4 @@ class ServiceNowMCP:
         # within an async context managed by the caller (e.g., using anyio
         # and a specific transport like stdio_server or SseServerTransport).
         return self.mcp_server
+
