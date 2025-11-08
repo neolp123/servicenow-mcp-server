@@ -18,12 +18,18 @@ COPY pyproject.toml README.md LICENSE ./
 # Copy source code
 COPY src/ ./src/
 
-# Create config directory
-RUN mkdir -p config logs
+# Copy config directory - IMPORTANT!
+COPY config/ ./config/
+
+# Create logs directory
+RUN mkdir -p logs
 
 # Install dependencies
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -e .
+
+# Verify config file exists (for debugging)
+RUN ls -la config/ && cat config/tool_packages.yaml | head -10
 
 # Expose port
 EXPOSE 8080
