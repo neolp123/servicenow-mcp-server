@@ -1,10 +1,14 @@
 """
 ServiceNow MCP SSE Server Implementation with API Key Authentication
+MODIFIED: Supports both SSE mode and stateless HTTP mode for ServiceNow compatibility
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
+from typing import Dict
 
 import uvicorn
 from dotenv import load_dotenv
@@ -25,6 +29,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# Global storage for stateless sessions
+stateless_sessions: Dict[str, dict] = {}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -53,15 +61,19 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 content={"error": "Unauthorized", "message": "Invalid or missing API key"}
             )
         
+        # Store validated API key in request state for stateless mode
+        request.state.api_key = provided_api_key
+        
         return await call_next(request)
 
 
-def create_sse_server_app(mcp_server) -> Starlette:
+def create_sse_server_app(mcp_server, servicenow_mcp_instance) -> Starlette:
     """
     Create Starlette app with SSE transport for MCP server.
     
     Args:
         mcp_server: The low-level MCP Server instance
+        servicenow_mcp_instance: The ServiceNowMCP instance for direct tool calls
         
     Returns:
         Configured Starlette application
@@ -94,13 +106,218 @@ def create_sse_server_app(mcp_server) -> Starlette:
             raise
     
     async def messages_handler(request: Request):
-        """Handle POST requests to /messages endpoint."""
+        """
+        Handle POST requests to /messages endpoint.
+        Supports both:
+        1. SSE mode: session_id in query params (original behavior)
+        2. Stateless mode: no session_id, uses API key for session management
+        """
         logger.info(f"POST message from {request.client}")
-        return await sse_transport.handle_post_message(
-            request.scope,
-            request.receive,
-            request._send
-        )
+        
+        # Check if this is SSE mode (has session_id) or stateless mode
+        session_id = request.query_params.get("session_id")
+        
+        if session_id:
+            # SSE mode - use the original SSE transport handler
+            logger.info(f"SSE mode: session_id={session_id}")
+            return await sse_transport.handle_post_message(
+                request.scope,
+                request.receive,
+                request._send
+            )
+        else:
+            # Stateless mode - handle directly
+            logger.info("Stateless mode: handling direct MCP request")
+            return await handle_stateless_request(request, servicenow_mcp_instance)
+    
+    async def handle_stateless_request(request: Request, mcp_instance):
+        """
+        Handle stateless MCP requests (ServiceNow compatibility mode).
+        Creates a virtual session based on API key.
+        """
+        try:
+            # Get API key from request state (set by middleware)
+            api_key = getattr(request.state, 'api_key', None)
+            if not api_key:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32001, "message": "API key required for stateless mode"},
+                        "id": None
+                    }
+                )
+            
+            # Create a deterministic session identifier from API key
+            session_key = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+            
+            # Parse the JSON-RPC request
+            body = await request.body()
+            try:
+                rpc_request = json.loads(body)
+            except json.JSONDecodeError as e:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32700, "message": f"Parse error: {e}"},
+                        "id": None
+                    }
+                )
+            
+            method = rpc_request.get("method")
+            params = rpc_request.get("params", {})
+            request_id = rpc_request.get("id")
+            
+            logger.info(f"Stateless request: method={method}, session={session_key}")
+            
+            # Initialize session if needed
+            if session_key not in stateless_sessions:
+                stateless_sessions[session_key] = {
+                    "initialized": False,
+                    "capabilities": {}
+                }
+                logger.info(f"Created new stateless session: {session_key}")
+            
+            session = stateless_sessions[session_key]
+            
+            # Handle different MCP methods
+            if method == "initialize":
+                logger.info("Handling initialize request")
+                session["initialized"] = True
+                session["capabilities"] = params.get("capabilities", {})
+                
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": {}  # Server supports tools
+                        },
+                        "serverInfo": {
+                            "name": "ServiceNow MCP Server",
+                            "version": "0.1.0"
+                        }
+                    }
+                }
+                return JSONResponse(response)
+            
+            elif method == "notifications/initialized":
+                logger.info("Handling initialized notification")
+                # No response needed for notifications
+                return Response(status_code=200)
+            
+            elif method == "tools/list":
+                logger.info("Handling tools/list request")
+                
+                if not session.get("initialized"):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32002, "message": "Session not initialized"},
+                            "id": request_id
+                        }
+                    )
+                
+                # Get tools from the MCP instance
+                tools_list = await mcp_instance._list_tools_impl()
+                
+                # Convert to JSON-RPC response format
+                tools_json = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": tool.inputSchema
+                    }
+                    for tool in tools_list
+                ]
+                
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "tools": tools_json
+                    }
+                }
+                
+                logger.info(f"Returning {len(tools_json)} tools")
+                return JSONResponse(response)
+            
+            elif method == "tools/call":
+                logger.info("Handling tools/call request")
+                
+                if not session.get("initialized"):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32002, "message": "Session not initialized"},
+                            "id": request_id
+                        }
+                    )
+                
+                tool_name = params.get("name")
+                tool_arguments = params.get("arguments", {})
+                
+                logger.info(f"Calling tool: {tool_name}")
+                
+                try:
+                    # Call the tool
+                    result = await mcp_instance._call_tool_impl(tool_name, tool_arguments)
+                    
+                    # Convert result to JSON-RPC response
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": result[0].text
+                                }
+                            ]
+                        }
+                    }
+                    
+                    return JSONResponse(response)
+                    
+                except Exception as e:
+                    logger.error(f"Error calling tool {tool_name}: {e}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32603,
+                                "message": f"Tool execution error: {str(e)}"
+                            },
+                            "id": request_id
+                        }
+                    )
+            
+            else:
+                logger.warning(f"Unknown method: {method}")
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32601, "message": f"Method not found: {method}"},
+                        "id": request_id
+                    }
+                )
+        
+        except Exception as e:
+            logger.error(f"Error in stateless handler: {e}", exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": f"Internal error: {str(e)}"},
+                    "id": None
+                }
+            )
     
     async def health_handler(request: Request):
         """Health check endpoint."""
@@ -108,6 +325,7 @@ def create_sse_server_app(mcp_server) -> Starlette:
             "status": "healthy",
             "service": "servicenow-mcp-sse",
             "version": "0.1.0",
+            "modes": ["sse", "stateless"],
             "authentication": "enabled" if os.getenv("MCP_API_KEY") else "disabled"
         })
     
@@ -115,12 +333,16 @@ def create_sse_server_app(mcp_server) -> Starlette:
         """Root endpoint with service information."""
         return JSONResponse({
             "service": "ServiceNow MCP Server",
-            "transport": "SSE",
+            "transport": "SSE + Stateless HTTP",
             "version": "0.1.0",
             "endpoints": {
-                "sse": "/sse",
-                "messages": "/messages",
+                "sse": "/sse (for persistent SSE connections)",
+                "messages": "/messages (supports both SSE with ?session_id=xxx and stateless mode)",
                 "health": "/health"
+            },
+            "modes": {
+                "sse": "POST /sse to establish connection, then POST /messages?session_id=xxx",
+                "stateless": "POST /messages directly with X-API-Key header (ServiceNow compatible)"
             },
             "authentication": "API Key required" if os.getenv("MCP_API_KEY") else "None"
         })
@@ -172,10 +394,10 @@ def create_servicenow_sse_server(instance_url: str, username: str, password: str
     servicenow_mcp = ServiceNowMCP(server_config)
     mcp_server = servicenow_mcp.start()
     
-    # Create Starlette app with SSE transport
-    starlette_app = create_sse_server_app(mcp_server)
+    # Create Starlette app with SSE transport AND stateless support
+    starlette_app = create_sse_server_app(mcp_server, servicenow_mcp)
     
-    logger.info("ServiceNow MCP SSE server created successfully")
+    logger.info("ServiceNow MCP SSE server created successfully (SSE + Stateless modes)")
     
     return mcp_server, starlette_app
 
@@ -230,6 +452,7 @@ def main():
         logger.warning("="*70)
     else:
         logger.info("API Key authentication enabled")
+        logger.info("Server supports BOTH SSE and Stateless HTTP modes")
     
     logger.info("Environment variables loaded successfully")
     
@@ -242,6 +465,11 @@ def main():
         )
         
         logger.info(f"Starting server on {args.host}:{args.port}")
+        logger.info("="*70)
+        logger.info("SUPPORTED MODES:")
+        logger.info("1. SSE Mode: GET /sse, then POST /messages?session_id=xxx")
+        logger.info("2. Stateless Mode: POST /messages directly (ServiceNow compatible)")
+        logger.info("="*70)
         
         # Configure uvicorn with SSE-friendly settings
         config = uvicorn.Config(
@@ -256,6 +484,7 @@ def main():
         server = uvicorn.Server(config)
         
         logger.info(f"SSE endpoint available at: http://{args.host}:{args.port}/sse")
+        logger.info(f"Messages endpoint: http://{args.host}:{args.port}/messages")
         logger.info(f"Health check available at: http://{args.host}:{args.port}/health")
         
         server.run()

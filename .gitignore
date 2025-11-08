@@ -181,3 +181,7 @@ cython_debug/
 .env.development
 .env.test
 .env.production
+
+# Test files
+test_*.py
+*.out
