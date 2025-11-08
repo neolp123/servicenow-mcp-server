@@ -7,19 +7,23 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential curl && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy project files
-COPY pyproject.toml ./
+# Copy project metadata files
+COPY pyproject.toml README.md LICENSE ./
+
+# Copy source code
 COPY src/ ./src/
 
-# Create directories
+# Create config directory
 RUN mkdir -p config logs
 
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -e .
+# Install dependencies
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -e .
 
 # Expose port
 EXPOSE 8080
