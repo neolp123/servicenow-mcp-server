@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: servicenow-mcp-sse
+    env: docker
+    region: oregon
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: SERVICENOW_INSTANCE_URL
+        sync: false
+      - key: SERVICENOW_USERNAME
+        sync: false
+      - key: SERVICENOW_PASSWORD
+        sync: false
+      - key: SERVICENOW_AUTH_TYPE
+        value: basic
+      - key: MCP_TOOL_PACKAGE
+        value: full
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health
